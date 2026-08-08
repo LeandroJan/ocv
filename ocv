@@ -5,7 +5,6 @@ if [[ -z "${BASH_VERSION:-}" ]]; then exec /usr/bin/env bash "$0" "$@"; fi
 set -euo pipefail
 
 MIRROR_BASE="https://mirror.openshift.com/pub/openshift-v4/clients/ocp"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRY_RUN=false
 FORCE=false
 IGNORE_SHA=false
@@ -23,15 +22,25 @@ cleanup_on_exit() {
     rm -rf "$TEMP_DIR" 2>/dev/null || true
   fi
 }
-trap cleanup_on_exit EXIT INT TERM
+# EXIT trap handles cleanup; INT/TERM just exit with the conventional
+# signal status, which fires the EXIT trap exactly once.
+trap cleanup_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Use a proper temp directory
 TEMP_DIR="$(mktemp -d -t ocv-XXXXXX)"
 
 load_config() {
+  # Parse key=value instead of sourcing: safer (no arbitrary code execution)
+  # and a malformed line can't kill the script under `set -e`.
   if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
+    local line
+    line="$(grep -E '^DEFAULT_SERIES="?[0-9]+\.[0-9]+"?$' "$CONFIG_FILE" | tail -n1 || true)"
+    if [[ -n "$line" ]]; then
+      DEFAULT_SERIES="${line#DEFAULT_SERIES=}"
+      DEFAULT_SERIES="${DEFAULT_SERIES//\"/}"
+    fi
   fi
 }
 
@@ -55,7 +64,7 @@ Usage:
   $(basename "$0") latest                  # install latest of remembered series
   $(basename "$0") use <version>           # switch to already installed version
   $(basename "$0") current                 # show current symlinks and active version
-  $(basename "$0") check                   # check for updates to current version4
+  $(basename "$0") check                   # check for updates to current version
   $(basename "$0") delete <version>        # remove version (relinks if needed)
 
 Examples:
@@ -88,9 +97,15 @@ validate_version() {
 }
 
 # Version comparison utilities
+# Portable numeric X.Y.Z sort (works on both BSD/macOS and GNU sort;
+# `sort -V` is not available on stock macOS)
+version_sort() {
+  sort -t. -k1,1n -k2,2n -k3,3n
+}
+
 version_min() {
   local v1="$1" v2="$2"
-  printf '%s\n%s\n' "$v1" "$v2" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1
+  printf '%s\n%s\n' "$v1" "$v2" | version_sort | head -n1
 }
 
 is_version_newer() {
@@ -98,7 +113,9 @@ is_version_newer() {
   [[ "$candidate" != "$(version_min "$current" "$candidate")" ]]
 }
 
-# Download with progress and resume capability
+# Download with progress and resume capability.
+# Downloads land in $CACHE_DIR/downloads (not the per-run temp dir) so an
+# interrupted download is actually resumable on the next invocation.
 download_with_progress() {
   local url="$1" output="$2"
   echo "Downloading $(basename "$output")..."
@@ -138,7 +155,10 @@ active_version() {
 }
 
 # ---------- listings with caching ----------
+# Usage: list_remote_versions [refresh]
+#   Pass "refresh" to bypass the cache TTL (used by `check`).
 list_remote_versions() {
+  local mode="${1:-}"
   local cache_file="${CACHE_DIR}/versions.txt"
   local cache_age=999999
 
@@ -148,16 +168,24 @@ list_remote_versions() {
     cache_age=$(($(date +%s) - $(stat -f%m "$cache_file" 2>/dev/null || stat -c%Y "$cache_file" 2>/dev/null || echo 0)))
   fi
 
-  if [[ $cache_age -gt $CACHE_TIMEOUT ]]; then
+  if [[ "$mode" == "refresh" || $cache_age -gt $CACHE_TIMEOUT ]]; then
     echo "Fetching latest versions..." >&2
-    curl -s "${MIRROR_BASE}/" \
-      | grep -Eo 'href="[0-9]+\.[0-9]+\.[0-9]+/' \
-      | sed 's/href="//;s#/##' \
-      | sort -t. -k1,1n -k2,2n -k3,3n \
-      | uniq > "$cache_file" || {
-        [[ -f "$cache_file" ]] && echo "Using cached versions (network unavailable)" >&2
-        [[ -f "$cache_file" ]] || { echo "No cached versions available" >&2; return 1; }
-      }
+    # Write to a temp file and swap in only on success, so a network
+    # failure never truncates/destroys the existing cache.
+    # -f makes curl fail on HTTP errors (plain -s would cache an error page).
+    local tmp="${TEMP_DIR}/versions.txt"
+    if curl -fsS "${MIRROR_BASE}/" \
+        | grep -Eo 'href="[0-9]+\.[0-9]+\.[0-9]+/' \
+        | sed 's/href="//;s#/##' \
+        | version_sort \
+        | uniq > "$tmp" && [[ -s "$tmp" ]]; then
+      mv -f "$tmp" "$cache_file"
+    elif [[ -s "$cache_file" ]]; then
+      echo "Using cached versions (network unavailable)" >&2
+    else
+      echo "No cached versions available" >&2
+      return 1
+    fi
   fi
 
   cat "$cache_file" 2>/dev/null || return 1
@@ -171,7 +199,7 @@ list_installed_versions() {
     find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
       | awk -F/ '{print $NF}' \
       | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-      | sort -t. -k1,1n -k2,2n -k3,3n \
+      | version_sort \
       | while read -r v; do
           if [[ -n "$active" && "$v" == "$active" ]]; then
             echo "* $v"
@@ -191,7 +219,7 @@ raw_installed_versions() {
     find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
       | awk -F/ '{print $NF}' \
       | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-      | sort -t. -k1,1n -k2,2n -k3,3n
+      | version_sort
   fi
 }
 
@@ -208,7 +236,9 @@ check_for_updates() {
   fi
 
   local series="${current%.*}"  # Extract X.Y from X.Y.Z
-  local latest; latest="$(resolve_latest_of_series "$series" 2>/dev/null || echo "")"
+  # Force a cache refresh: checking for updates against a stale cache
+  # defeats the purpose of `check`.
+  local latest; latest="$(resolve_latest_of_series "$series" refresh 2>/dev/null || echo "")"
 
   if [[ -n "$latest" && "$latest" != "$current" ]] && is_version_newer "$current" "$latest"; then
     echo "📦 Update available: $current → $latest"
@@ -332,30 +362,37 @@ verify_sha256() {
     return 0
   fi
 
+  # Fail closed: these are binaries going into PATH. If we can't verify,
+  # we abort — only --ignore-sha may bypass verification.
   local sums_file="${TEMP_DIR}/sha256sum-${version}.txt"
-  if curl -fsS -o "$sums_file" "$sums_url"; then
-    local expected
-    expected="$(awk -v fn="$file_name" '$2==fn || $2==("*"fn){print $1}' "$sums_file" | head -n1)"
-    if [[ -n "${expected:-}" ]]; then
-      local actual
-      if command -v sha256sum >/dev/null 2>&1; then
-        actual="$(sha256sum "$file_path" | awk '{print $1}')"
-      else
-        actual="$(shasum -a 256 "$file_path" | awk '{print $1}')"
-      fi
-      [[ "$actual" == "$expected" ]] || {
-        echo "Invalid SHA256 for $file_name" >&2
-        echo "Expected: $expected" >&2
-        echo "Actual:   $actual" >&2
-        echo "Use --ignore-sha to skip verification if you're aware of known mismatches."
-        exit 3
-      }
-    else
-      echo "⚠️  No matching entry found for $file_name in sha256sum-${version}.txt"
-    fi
-  else
-    echo "⚠️  Could not fetch sha256sum.txt (network or file missing)"
+  if ! curl -fsS -o "$sums_file" "$sums_url"; then
+    echo "Error: could not fetch ${sums_url} (network or file missing)" >&2
+    echo "Refusing to install unverified binaries. Use --ignore-sha to bypass." >&2
+    exit 3
   fi
+
+  local expected
+  expected="$(awk -v fn="$file_name" '$2==fn || $2==("*"fn){print $1}' "$sums_file" | head -n1)"
+  if [[ -z "${expected:-}" ]]; then
+    echo "Error: no entry for $file_name in sha256sum.txt for ${version}" >&2
+    echo "Refusing to install unverified binaries. Use --ignore-sha to bypass." >&2
+    exit 3
+  fi
+
+  local actual
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$file_path" | awk '{print $1}')"
+  else
+    actual="$(shasum -a 256 "$file_path" | awk '{print $1}')"
+  fi
+  [[ "$actual" == "$expected" ]] || {
+    echo "Invalid SHA256 for $file_name" >&2
+    echo "Expected: $expected" >&2
+    echo "Actual:   $actual" >&2
+    echo "Use --ignore-sha to skip verification if you're aware of known mismatches." >&2
+    exit 3
+  }
+  echo "✅ SHA256 verified: ${file_name}"
 }
 
 extract_tar() {
@@ -422,7 +459,9 @@ current_version() {
 
   if [[ -n "$version" ]]; then
     if [[ -n "${oc_target:-}" && -n "${install_target:-}" ]]; then
-      if [[ ! "$oc_target" =~ "/ocp/$version/oc"$ || ! "$install_target" =~ "/ocp/$version/openshift-install"$ ]]; then
+      # Escape dots so 4.18.24 can't accidentally match e.g. 4x18y24
+      local escaped_version="${version//./\\.}"
+      if [[ ! "$oc_target" =~ /ocp/${escaped_version}/oc$ || ! "$install_target" =~ /ocp/${escaped_version}/openshift-install$ ]]; then
         echo "⚠️  Warning: 'oc' and 'openshift-install' point to different versions."
       fi
     fi
@@ -482,14 +521,21 @@ delete_version() {
   current_version
 }
 
+# Usage: resolve_latest_of_series <series> [refresh]
 resolve_latest_of_series() {
-  local series="$1"   # e.g.: 4.18
+  local series="$1" mode="${2:-}"   # e.g.: 4.18
   [[ "$series" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "Invalid series: $series (use X.Y, e.g. 4.18)" >&2; return 1; }
   local escaped_series="${series//./\\.}"
-  list_remote_versions \
+  local result
+  result="$(list_remote_versions "$mode" \
     | grep -E "^${escaped_series}\.[0-9]+$" \
-    | sort -t. -k1,1n -k2,2n -k3,3n \
-    | tail -n1
+    | version_sort \
+    | tail -n1 || true)"
+  if [[ -z "$result" ]]; then
+    echo "No versions found for series ${series} on the mirror" >&2
+    return 1
+  fi
+  echo "$result"
 }
 
 install_version() {
@@ -497,16 +543,13 @@ install_version() {
   validate_version "$version" || exit 1
   local vd; vd="$(version_dir "$version")"
 
-  if [[ -d "$vd" ]]; then
-    if $FORCE; then
-      echo "Removing existing installation (--force)..."
-      rm -rf "$vd"
-    else
-      echo "Version $version already installed at $vd"
-      echo "Use 'ocv use $version' to switch, or --force to reinstall"
-      return 0
-    fi
+  if [[ -d "$vd" && "$FORCE" != "true" ]]; then
+    echo "Version $version already installed at $vd"
+    echo "Use 'ocv use $version' to switch, or --force to reinstall"
+    return 0
   fi
+  # Note: with --force the existing install is only removed at the very
+  # end, after download/verify/extract all succeed (atomic swap below).
 
   if $DRY_RUN; then
     echo "DRY-RUN: would probe & download ${MIRROR_BASE}/${version}/{openshift-install-...,openshift-client-...}.tar.gz"
@@ -521,9 +564,14 @@ install_version() {
   local installer; installer="$(pick_artifact install "$version" "$base_url")" || exit 4
   local client;    client="$(pick_artifact client  "$version" "$base_url")" || exit 4
 
-  local installer_path="${TEMP_DIR}/${installer}"
-  local client_path="${TEMP_DIR}/${client}"
+  # Downloads go to the cache dir (not TEMP_DIR) so curl -C - can resume
+  # a previously interrupted download across runs.
+  local dl_dir="${CACHE_DIR}/downloads"
+  mkdir -p "$dl_dir"
+  local installer_path="${dl_dir}/${installer}"
+  local client_path="${dl_dir}/${client}"
   local extract_dir="${TEMP_DIR}/extract-${version}"
+  local staged_dir="${TEMP_DIR}/staged-${version}"
 
   echo "➡️  Downloading ${version} (${OS_NAME}/${ARCH_NAME}) ..."
 
@@ -537,11 +585,27 @@ install_version() {
   extract_tar "${installer_path}" "${extract_dir}/installer"
   extract_tar "${client_path}"    "${extract_dir}/client"
 
-  mkdir -p "$(ocp_root)" "$(bin_root)" "$vd"
+  # Stage the final layout in the temp dir, validating contents, so a
+  # failure here never leaves a half-populated version dir behind.
+  mkdir -p "$staged_dir"
+  [[ -f "${extract_dir}/installer/openshift-install" ]] \
+    || { echo "Error: openshift-install not found in ${installer}" >&2; exit 4; }
+  [[ -f "${extract_dir}/client/oc" ]] \
+    || { echo "Error: oc not found in ${client}" >&2; exit 4; }
+  mv -f "${extract_dir}/installer/openshift-install" "${staged_dir}/openshift-install"
+  mv -f "${extract_dir}/client/oc"                   "${staged_dir}/oc"
+  chmod +x "${staged_dir}/openshift-install" "${staged_dir}/oc"
 
-  mv -f "${extract_dir}/installer/openshift-install" "${vd}/openshift-install"
-  [[ -f "${extract_dir}/client/oc" ]] && mv -f "${extract_dir}/client/oc" "${vd}/oc"
-  chmod +x "${vd}/openshift-install" "${vd}/oc" 2>/dev/null || true
+  # Atomic-ish swap: only now touch the real version dir.
+  mkdir -p "$(ocp_root)" "$(bin_root)"
+  if [[ -d "$vd" ]]; then
+    echo "Replacing existing installation (--force)..."
+    rm -rf "$vd"
+  fi
+  mv "$staged_dir" "$vd"
+
+  # Successful install: downloaded archives are no longer needed.
+  rm -f "$installer_path" "$client_path"
 
   echo "Installed under ${vd}"
   link_version "$version"
@@ -614,8 +678,12 @@ case "$1" in
   latest)
     if [[ $# -ge 2 ]]; then
       series="$2"
-      DEFAULT_SERIES="$series"
-      save_config
+      if $DRY_RUN; then
+        echo "DRY-RUN: would remember series ${series} in ${CONFIG_FILE}"
+      else
+        DEFAULT_SERIES="$series"
+        save_config
+      fi
     elif [[ -n "$DEFAULT_SERIES" ]]; then
       series="$DEFAULT_SERIES"
       echo "Using remembered series: $series"
