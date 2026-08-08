@@ -57,8 +57,10 @@ usage() {
 OpenShift CLI Version Manager
 
 Usage:
-  $(basename "$0") list                     # list versions (* = active, + = installed)
-  $(basename "$0") list-installed           # list versions installed locally (marks active with *)
+  $(basename "$0") list                     # list remote versions (* = active, + = installed)
+  $(basename "$0") list installed          # list versions installed locally
+  $(basename "$0") list latest <series>    # show latest patch of series, without installing
+  $(basename "$0") list <series>           # list remote versions of a series (e.g., list 4.18)
   $(basename "$0") <version>               # install specific version (e.g., 4.18.24)
   $(basename "$0") latest <series>         # install latest patch of series (e.g., latest 4.18)
   $(basename "$0") latest                  # install latest of remembered series
@@ -68,7 +70,9 @@ Usage:
   $(basename "$0") delete <version>        # remove version (relinks if needed)
 
 Examples:
-  $(basename "$0") list                     # Show all available versions
+  $(basename "$0") list installed          # Show what's installed locally
+  $(basename "$0") list latest 4.18        # Print latest 4.18.x (no install)
+  $(basename "$0") list 4.18               # Show all remote 4.18.x versions
   $(basename "$0") 4.18.24                 # Install specific version
   $(basename "$0") latest 4.18             # Install latest 4.18.x (remembers series)
   $(basename "$0") latest                   # Install latest of remembered series
@@ -646,19 +650,57 @@ if [[ $# -eq 0 ]]; then usage; exit 0; fi
 # ---------- main ----------
 case "$1" in
   list)
-    _installed="$(raw_installed_versions)"
-    _av="$(active_version 2>/dev/null || true)"
-    while IFS= read -r v; do
-      if [[ -n "$_av" && "$v" == "$_av" ]]; then
-        echo "* $v"
-      elif echo "$_installed" | grep -qxF "$v"; then
-        echo "+ $v"
-      else
-        echo "  $v"
-      fi
-    done < <(list_remote_versions)
+    case "${2:-}" in
+      installed)
+        list_installed_versions
+        ;;
+      latest)
+        # ocv list latest [<series>] -> print latest patch of series, no install.
+        # Single line on stdout (notes go to stderr) so it's script-friendly:
+        #   ver="$(ocv list latest 4.18)"
+        if [[ -n "${3:-}" ]]; then
+          series="$3"
+        elif [[ -n "$DEFAULT_SERIES" ]]; then
+          series="$DEFAULT_SERIES"
+          echo "Using remembered series: $series" >&2
+        else
+          echo "Usage: ocv list latest <series>   # e.g., ocv list latest 4.18" >&2
+          exit 1
+        fi
+        resolve_latest_of_series "$series" || exit 1
+        ;;
+      remote|all|"")
+        # default: remote listing with markers (* = active, + = installed)
+        _installed="$(raw_installed_versions)"
+        _av="$(active_version 2>/dev/null || true)"
+        while IFS= read -r v; do
+          if [[ -n "$_av" && "$v" == "$_av" ]]; then
+            echo "* $v"
+          elif echo "$_installed" | grep -qxF "$v"; then
+            echo "+ $v"
+          else
+            echo "  $v"
+          fi
+        done < <(list_remote_versions)
+        ;;
+      [0-9]*.[0-9]*)
+        # ocv list 4.18 -> filter remote list by series
+        series="$2"
+        [[ "$series" =~ ^[0-9]+\.[0-9]+$ ]] \
+          || { echo "Invalid series: $series (use X.Y, e.g. 4.18)" >&2; exit 1; }
+        list_remote_versions | grep -E "^${series//./\\.}\.[0-9]+$" || {
+          echo "No versions found for series $series" >&2
+          exit 1
+        }
+        ;;
+      *)
+        echo "Unknown list target: '$2'" >&2
+        echo "Expected: installed, latest [<series>], remote, or a series like 4.18" >&2
+        exit 1
+        ;;
+    esac
     ;;
-  list-installed|list_installed)  # accept both hyphen/underscore
+  list-installed|list_installed)  # legacy aliases for 'list installed'
     list_installed_versions
     ;;
   use)
