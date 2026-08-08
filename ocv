@@ -1,0 +1,639 @@
+#!/usr/bin/env bash
+# Re-exec in bash if run with sh
+if [[ -z "${BASH_VERSION:-}" ]]; then exec /usr/bin/env bash "$0" "$@"; fi
+
+set -euo pipefail
+
+MIRROR_BASE="https://mirror.openshift.com/pub/openshift-v4/clients/ocp"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DRY_RUN=false
+FORCE=false
+IGNORE_SHA=false
+
+# Configuration and caching
+CONFIG_FILE="${HOME}/.ocv.conf"
+CACHE_DIR="${HOME}/.cache/ocv"
+CACHE_TIMEOUT=3600  # 1 hour
+DEFAULT_SERIES=""
+TEMP_DIR=""
+
+# Cleanup and error handling
+cleanup_on_exit() {
+  if [[ -n "${TEMP_DIR:-}" && -d "$TEMP_DIR" ]]; then
+    rm -rf "$TEMP_DIR" 2>/dev/null || true
+  fi
+}
+trap cleanup_on_exit EXIT INT TERM
+
+# Use a proper temp directory
+TEMP_DIR="$(mktemp -d -t ocv-XXXXXX)"
+
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+  fi
+}
+
+save_config() {
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  cat > "$CONFIG_FILE" <<EOF
+# OCV Configuration
+DEFAULT_SERIES="$DEFAULT_SERIES"
+EOF
+}
+
+usage() {
+  cat <<EOF
+OpenShift CLI Version Manager
+
+Usage:
+  $(basename "$0") list                     # list versions (* = active, + = installed)
+  $(basename "$0") list-installed           # list versions installed locally (marks active with *)
+  $(basename "$0") <version>               # install specific version (e.g., 4.18.24)
+  $(basename "$0") latest <series>         # install latest patch of series (e.g., latest 4.18)
+  $(basename "$0") latest                  # install latest of remembered series
+  $(basename "$0") use <version>           # switch to already installed version
+  $(basename "$0") current                 # show current symlinks and active version
+  $(basename "$0") check                   # check for updates to current version4
+  $(basename "$0") delete <version>        # remove version (relinks if needed)
+
+Examples:
+  $(basename "$0") list                     # Show all available versions
+  $(basename "$0") 4.18.24                 # Install specific version
+  $(basename "$0") latest 4.18             # Install latest 4.18.x (remembers series)
+  $(basename "$0") latest                   # Install latest of remembered series
+  $(basename "$0") use 4.16.30             # Switch to already installed version
+  $(basename "$0") check                    # Check if newer version available
+  $(basename "$0") delete 4.16.30          # Remove old version
+
+Options:
+  --dry-run      Show what would happen without making changes
+  --force        Force reinstall of an already installed version
+  --ignore-sha   Skip SHA256 verification
+
+Configuration:
+  Config file: ~/.ocv.conf
+  Cache dir: ~/.cache/ocv/
+EOF
+}
+
+# Input validation
+validate_version() {
+  local version="$1"
+  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "Error: Invalid version format '$version'. Expected format: X.Y.Z (e.g., 4.18.24)" >&2
+    return 1
+  fi
+}
+
+# Version comparison utilities
+version_min() {
+  local v1="$1" v2="$2"
+  printf '%s\n%s\n' "$v1" "$v2" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1
+}
+
+is_version_newer() {
+  local current="$1" candidate="$2"
+  [[ "$candidate" != "$(version_min "$current" "$candidate")" ]]
+}
+
+# Download with progress and resume capability
+download_with_progress() {
+  local url="$1" output="$2"
+  echo "Downloading $(basename "$output")..."
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --progress-bar -C - -o "$output" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -c -O "$output" "$url" --progress=bar:force 2>&1
+  else
+    echo "Error: Neither curl nor wget found" >&2
+    return 1
+  fi
+}
+
+# ---------- path helpers ----------
+bin_root() { echo "$HOME/bin"; }
+ocp_root() { echo "$(bin_root)/ocp"; }
+version_dir() { echo "$(ocp_root)/$1"; }
+
+# ---------- active version helper ----------
+active_version() {
+  local br; br="$(bin_root)"
+  local t
+  if [[ -L "${br}/oc" ]]; then
+    t="$(readlink "${br}/oc")"
+    if [[ "$t" =~ /ocp/([0-9]+\.[0-9]+\.[0-9]+)/oc$ ]]; then
+      echo "${BASH_REMATCH[1]}"; return 0
+    fi
+  fi
+  if [[ -L "${br}/openshift-install" ]]; then
+    t="$(readlink "${br}/openshift-install")"
+    if [[ "$t" =~ /ocp/([0-9]+\.[0-9]+\.[0-9]+)/openshift-install$ ]]; then
+      echo "${BASH_REMATCH[1]}"; return 0
+    fi
+  fi
+  return 1
+}
+
+# ---------- listings with caching ----------
+list_remote_versions() {
+  local cache_file="${CACHE_DIR}/versions.txt"
+  local cache_age=999999
+
+  mkdir -p "$CACHE_DIR"
+
+  if [[ -f "$cache_file" ]]; then
+    cache_age=$(($(date +%s) - $(stat -f%m "$cache_file" 2>/dev/null || stat -c%Y "$cache_file" 2>/dev/null || echo 0)))
+  fi
+
+  if [[ $cache_age -gt $CACHE_TIMEOUT ]]; then
+    echo "Fetching latest versions..." >&2
+    curl -s "${MIRROR_BASE}/" \
+      | grep -Eo 'href="[0-9]+\.[0-9]+\.[0-9]+/' \
+      | sed 's/href="//;s#/##' \
+      | sort -t. -k1,1n -k2,2n -k3,3n \
+      | uniq > "$cache_file" || {
+        [[ -f "$cache_file" ]] && echo "Using cached versions (network unavailable)" >&2
+        [[ -f "$cache_file" ]] || { echo "No cached versions available" >&2; return 1; }
+      }
+  fi
+
+  cat "$cache_file" 2>/dev/null || return 1
+}
+
+# Pretty, marked list (for user)
+list_installed_versions() {
+  local root; root="$(ocp_root)"
+  local active; active="$(active_version 2>/dev/null || true)"
+  if [[ -d "$root" ]]; then
+    find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
+      | awk -F/ '{print $NF}' \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+      | sort -t. -k1,1n -k2,2n -k3,3n \
+      | while read -r v; do
+          if [[ -n "$active" && "$v" == "$active" ]]; then
+            echo "* $v"
+          else
+            echo "  $v"
+          fi
+        done
+  else
+    echo "(none installed)"
+  fi
+}
+
+# Raw, unformatted list (for internal logic)
+raw_installed_versions() {
+  local root; root="$(ocp_root)"
+  if [[ -d "$root" ]]; then
+    find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
+      | awk -F/ '{print $NF}' \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+      | sort -t. -k1,1n -k2,2n -k3,3n
+  fi
+}
+
+latest_installed_version() {
+  raw_installed_versions | tail -n1
+}
+
+# Update checking functionality
+check_for_updates() {
+  local current; current="$(active_version 2>/dev/null || echo "none")"
+  if [[ "$current" == "none" ]]; then
+    echo "No version currently active"
+    return 0
+  fi
+
+  local series="${current%.*}"  # Extract X.Y from X.Y.Z
+  local latest; latest="$(resolve_latest_of_series "$series" 2>/dev/null || echo "")"
+
+  if [[ -n "$latest" && "$latest" != "$current" ]] && is_version_newer "$current" "$latest"; then
+    echo "📦 Update available: $current → $latest"
+    echo "Run: ocv latest $series"
+  else
+    echo "✅ You're on the latest version of series $series: $current"
+  fi
+}
+
+# ---------- platform detection & artifact selection ----------
+OS_NAME="" ARCH_NAME="" EXT=".tar.gz"
+
+detect_platform() {
+  OS_NAME="$(uname -s)"
+  ARCH_NAME="$(uname -m)"
+  case "$OS_NAME" in
+    Darwin|Linux) : ;;
+    *) echo "Unsupported OS: $OS_NAME" >&2; exit 2 ;;
+  esac
+  # EXT already set to .tar.gz (Windows ZIPs are not relevant here)
+}
+
+# List candidate artifact names (in order), given kind=install|client and a version
+artifact_candidates() {
+  local kind="$1" version="$2"
+  case "$OS_NAME" in
+    Darwin)
+      case "$ARCH_NAME" in
+        arm64)
+          if [[ "$kind" == "install" ]]; then
+            printf "openshift-install-mac-arm64-%s%s\n" "$version" "$EXT"
+            printf "openshift-install-mac-%s%s\n"        "$version" "$EXT"
+          else
+            printf "openshift-client-mac-arm64-%s%s\n" "$version" "$EXT"
+            printf "openshift-client-mac-%s%s\n"        "$version" "$EXT"
+          fi
+          ;;
+        x86_64)
+          if [[ "$kind" == "install" ]]; then
+            printf "openshift-install-mac-%s%s\n" "$version" "$EXT"
+          else
+            printf "openshift-client-mac-%s%s\n" "$version" "$EXT"
+          fi
+          ;;
+        *)
+          echo "Unsupported macOS arch: $ARCH_NAME" >&2; exit 2 ;;
+      esac
+      ;;
+    Linux)
+      case "$ARCH_NAME" in
+        x86_64|amd64)
+          if [[ "$kind" == "install" ]]; then
+            printf "openshift-install-linux-%s%s\n" "$version" "$EXT"
+            printf "openshift-install-linux-x86_64-%s%s\n" "$version" "$EXT"
+          else
+            printf "openshift-client-linux-%s%s\n" "$version" "$EXT"
+            printf "openshift-client-linux-x86_64-%s%s\n" "$version" "$EXT"
+          fi
+          ;;
+        aarch64|arm64)
+          if [[ "$kind" == "install" ]]; then
+            printf "openshift-install-linux-arm64-%s%s\n" "$version" "$EXT"
+            printf "openshift-install-linux-%s%s\n" "$version" "$EXT"   # fallback generic
+          else
+            printf "openshift-client-linux-arm64-%s%s\n" "$version" "$EXT"
+            printf "openshift-client-linux-%s%s\n" "$version" "$EXT"    # fallback generic
+          fi
+          ;;
+        ppc64le)
+          if [[ "$kind" == "install" ]]; then
+            # installer usually not provided for ppc64le; try generic as last resort
+            printf "openshift-install-linux-%s%s\n" "$version" "$EXT"
+          else
+            printf "openshift-client-linux-ppc64le-%s%s\n" "$version" "$EXT"
+            printf "openshift-client-linux-%s%s\n"         "$version" "$EXT"
+          fi
+          ;;
+        s390x)
+          if [[ "$kind" == "install" ]]; then
+            printf "openshift-install-linux-%s%s\n" "$version" "$EXT"
+          else
+            printf "openshift-client-linux-s390x-%s%s\n" "$version" "$EXT"
+            printf "openshift-client-linux-%s%s\n"       "$version" "$EXT"
+          fi
+          ;;
+        *)
+          echo "Unsupported Linux arch: $ARCH_NAME" >&2; exit 2 ;;
+      esac
+      ;;
+  esac
+}
+
+# Pick the first candidate that exists on the mirror; echo filename or fail
+pick_artifact() {
+  local kind="$1" version="$2" base_url="$3"
+  local cand
+  while IFS= read -r cand; do
+    if curl -fsI "${base_url}/${cand}" >/dev/null; then
+      echo "$cand"
+      return 0
+    fi
+  done < <(artifact_candidates "$kind" "$version")
+  echo "Error: no ${kind} artifact found for OS=${OS_NAME} ARCH=${ARCH_NAME} version=${version}" >&2
+  echo "Tried:" >&2
+  artifact_candidates "$kind" "$version" | sed 's/^/  - /' >&2
+  return 1
+}
+
+verify_sha256() {
+  local version="$1" file_path="$2"
+  local file_name; file_name="$(basename "$file_path")"
+  local sums_url="${MIRROR_BASE}/${version}/sha256sum.txt"
+
+  if [[ "${IGNORE_SHA:-false}" == "true" ]]; then
+    echo "⚠️  SHA256 verification skipped (--ignore-sha enabled) for ${file_name}"
+    return 0
+  fi
+
+  if $DRY_RUN; then
+    echo "DRY-RUN: verify sha256 of ${file_name} using ${sums_url}"
+    return 0
+  fi
+
+  local sums_file="${TEMP_DIR}/sha256sum-${version}.txt"
+  if curl -fsS -o "$sums_file" "$sums_url"; then
+    local expected
+    expected="$(awk -v fn="$file_name" '$2==fn || $2==("*"fn){print $1}' "$sums_file" | head -n1)"
+    if [[ -n "${expected:-}" ]]; then
+      local actual
+      if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$file_path" | awk '{print $1}')"
+      else
+        actual="$(shasum -a 256 "$file_path" | awk '{print $1}')"
+      fi
+      [[ "$actual" == "$expected" ]] || {
+        echo "Invalid SHA256 for $file_name" >&2
+        echo "Expected: $expected" >&2
+        echo "Actual:   $actual" >&2
+        echo "Use --ignore-sha to skip verification if you're aware of known mismatches."
+        exit 3
+      }
+    else
+      echo "⚠️  No matching entry found for $file_name in sha256sum-${version}.txt"
+    fi
+  else
+    echo "⚠️  Could not fetch sha256sum.txt (network or file missing)"
+  fi
+}
+
+extract_tar() {
+  local archive="$1" dest="$2"
+  if $DRY_RUN; then
+    echo "DRY-RUN: tar -xzf \"$archive\" -C \"$dest\""
+    return
+  fi
+  mkdir -p "$dest"
+  tar -xzf "$archive" -C "$dest"
+}
+
+# ---------- operations ----------
+link_version() {
+  local version="$1"
+  local br; br="$(bin_root)"
+  local vd; vd="$(version_dir "$version")"
+
+  if $DRY_RUN; then
+    echo "DRY-RUN: ln -sfn ${vd}/oc ${br}/oc"
+    echo "DRY-RUN: ln -sfn ${vd}/openshift-install ${br}/openshift-install"
+    return
+  fi
+
+  ln -sfn "${vd}/oc"                "${br}/oc"
+  ln -sfn "${vd}/openshift-install" "${br}/openshift-install"
+  echo "Symlinks updated -> ${version}"
+
+  if ! echo ":$PATH:" | grep -q ":$HOME/bin:"; then
+    echo "ℹ️  Add ~/bin to PATH (e.g., zsh):"
+    echo '   echo '\''export PATH="$HOME/bin:$PATH"'\'' >> ~/.zshrc && exec zsh'
+  fi
+}
+
+use_version() {
+  local version="$1"
+  validate_version "$version" || exit 1
+  local vd; vd="$(version_dir "$version")"
+  [[ -d "$vd" ]] || { echo "Version not installed: ${vd}"; exit 4; }
+  link_version "$version"
+}
+
+current_version() {
+  local br; br="$(bin_root)"
+  local oc_target install_target version=""
+
+  if [[ -L "${br}/oc" ]]; then
+    oc_target="$(readlink "${br}/oc")"
+    echo "oc -> $oc_target"
+    [[ "$oc_target" =~ /ocp/([0-9]+\.[0-9]+\.[0-9]+)/oc$ ]] && version="${BASH_REMATCH[1]}"
+  else
+    echo "oc symlink not found"
+  fi
+
+  if [[ -L "${br}/openshift-install" ]]; then
+    install_target="$(readlink "${br}/openshift-install")"
+    echo "openshift-install -> $install_target"
+    if [[ -z "$version" && "$install_target" =~ /ocp/([0-9]+\.[0-9]+\.[0-9]+)/openshift-install$ ]]; then
+      version="${BASH_REMATCH[1]}"
+    fi
+  else
+    echo "openshift-install symlink not found"
+  fi
+
+  if [[ -n "$version" ]]; then
+    if [[ -n "${oc_target:-}" && -n "${install_target:-}" ]]; then
+      if [[ ! "$oc_target" =~ "/ocp/$version/oc"$ || ! "$install_target" =~ "/ocp/$version/openshift-install"$ ]]; then
+        echo "⚠️  Warning: 'oc' and 'openshift-install' point to different versions."
+      fi
+    fi
+    echo "active version: $version"
+  else
+    echo "active version: (undefined)"
+  fi
+}
+
+delete_version() {
+  local version="$1"
+  validate_version "$version" || exit 1
+  local br; br="$(bin_root)"
+  local vd; vd="$(version_dir "$version")"
+
+  [[ -d "$vd" ]] || { echo "Version not found: ${vd}"; exit 4; }
+
+  # Consider "current" if either symlink points to this version
+  local was_current=false
+  [[ -L "${br}/oc" && "$(readlink "${br}/oc")" == "${vd}/oc" ]] && was_current=true
+  [[ -L "${br}/openshift-install" && "$(readlink "${br}/openshift-install")" == "${vd}/openshift-install" ]] && was_current=true
+
+  if $DRY_RUN; then
+    echo "DRY-RUN: rm -rf ${vd}"
+  else
+    rm -rf "${vd}"
+    echo "Removed version ${version}"
+  fi
+
+  # Determine highest remaining version after deletion
+  local latest; latest="$(latest_installed_version || true)"
+
+  # Are current symlinks valid?
+  local oc_ok=false inst_ok=false
+  [[ -L "${br}/oc"                && -e "$(readlink "${br}/oc")"                ]] && oc_ok=true
+  [[ -L "${br}/openshift-install" && -e "$(readlink "${br}/openshift-install")" ]] && inst_ok=true
+  local symlinks_broken=false
+  $oc_ok && $inst_ok || symlinks_broken=true
+
+  if [[ -n "${latest:-}" && -d "$(version_dir "$latest")" ]]; then
+    # If deleted was active OR links are broken/missing, relink to latest
+    if $was_current || $symlinks_broken; then
+      echo "Relinking to ${latest}"
+      link_version "$latest"
+    fi
+  else
+    # No versions left — remove symlinks
+    echo "No other versions installed, removing symlinks"
+    if $DRY_RUN; then
+      echo "DRY-RUN: rm -f \"${br}/oc\" \"${br}/openshift-install\""
+    else
+      rm -f "${br}/oc" "${br}/openshift-install"
+    fi
+  fi
+
+  # Show current state after delete
+  current_version
+}
+
+resolve_latest_of_series() {
+  local series="$1"   # e.g.: 4.18
+  [[ "$series" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "Invalid series: $series (use X.Y, e.g. 4.18)" >&2; return 1; }
+  local escaped_series="${series//./\\.}"
+  list_remote_versions \
+    | grep -E "^${escaped_series}\.[0-9]+$" \
+    | sort -t. -k1,1n -k2,2n -k3,3n \
+    | tail -n1
+}
+
+install_version() {
+  local version="$1"
+  validate_version "$version" || exit 1
+  local vd; vd="$(version_dir "$version")"
+
+  if [[ -d "$vd" ]]; then
+    if $FORCE; then
+      echo "Removing existing installation (--force)..."
+      rm -rf "$vd"
+    else
+      echo "Version $version already installed at $vd"
+      echo "Use 'ocv use $version' to switch, or --force to reinstall"
+      return 0
+    fi
+  fi
+
+  if $DRY_RUN; then
+    echo "DRY-RUN: would probe & download ${MIRROR_BASE}/${version}/{openshift-install-...,openshift-client-...}.tar.gz"
+    echo "DRY-RUN: would extract into ${vd} and update symlinks in $(bin_root)"
+    return
+  fi
+
+  detect_platform
+
+  local base_url="${MIRROR_BASE}/${version}"
+  # choose filenames by probing the mirror
+  local installer; installer="$(pick_artifact install "$version" "$base_url")" || exit 4
+  local client;    client="$(pick_artifact client  "$version" "$base_url")" || exit 4
+
+  local installer_path="${TEMP_DIR}/${installer}"
+  local client_path="${TEMP_DIR}/${client}"
+  local extract_dir="${TEMP_DIR}/extract-${version}"
+
+  echo "➡️  Downloading ${version} (${OS_NAME}/${ARCH_NAME}) ..."
+
+  download_with_progress "${base_url}/${installer}" "${installer_path}"
+  download_with_progress "${base_url}/${client}" "${client_path}"
+
+  verify_sha256 "$version" "${installer_path}"
+  verify_sha256 "$version" "${client_path}"
+
+  echo "Extracting ..."
+  extract_tar "${installer_path}" "${extract_dir}/installer"
+  extract_tar "${client_path}"    "${extract_dir}/client"
+
+  mkdir -p "$(ocp_root)" "$(bin_root)" "$vd"
+
+  mv -f "${extract_dir}/installer/openshift-install" "${vd}/openshift-install"
+  [[ -f "${extract_dir}/client/oc" ]] && mv -f "${extract_dir}/client/oc" "${vd}/oc"
+  chmod +x "${vd}/openshift-install" "${vd}/oc" 2>/dev/null || true
+
+  echo "Installed under ${vd}"
+  link_version "$version"
+}
+
+# ---------- argument parsing ----------
+declare -a args=()
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run)
+      DRY_RUN=true
+      ;;
+    --force)
+      FORCE=true
+      ;;
+    --ignore-sha)
+      IGNORE_SHA=true
+      ;;
+    *)
+      args+=("$arg")
+      ;;
+  esac
+done
+
+# Replace original argument list with the cleaned ones
+if ((${#args[@]})); then
+  set -- "${args[@]}"
+else
+  set --
+fi
+
+# Load configuration
+load_config
+
+# no args -> usage
+if [[ $# -eq 0 ]]; then usage; exit 0; fi
+
+# ---------- main ----------
+case "$1" in
+  list)
+    _installed="$(raw_installed_versions)"
+    _av="$(active_version 2>/dev/null || true)"
+    while IFS= read -r v; do
+      if [[ -n "$_av" && "$v" == "$_av" ]]; then
+        echo "* $v"
+      elif echo "$_installed" | grep -qxF "$v"; then
+        echo "+ $v"
+      else
+        echo "  $v"
+      fi
+    done < <(list_remote_versions)
+    ;;
+  list-installed|list_installed)  # accept both hyphen/underscore
+    list_installed_versions
+    ;;
+  use)
+    [[ $# -ge 2 ]] || { usage; exit 0; }
+    use_version "$2"
+    ;;
+  current)
+    current_version
+    ;;
+  delete)
+    [[ $# -ge 2 ]] || { usage; exit 0; }
+    delete_version "$2"
+    ;;
+  check|check-update)
+    check_for_updates
+    ;;
+  latest)
+    if [[ $# -ge 2 ]]; then
+      series="$2"
+      DEFAULT_SERIES="$series"
+      save_config
+    elif [[ -n "$DEFAULT_SERIES" ]]; then
+      series="$DEFAULT_SERIES"
+      echo "Using remembered series: $series"
+    else
+      echo "No series specified and no default series configured"
+      echo "Usage: ocv latest <series>  # e.g., ocv latest 4.18"
+      exit 1
+    fi
+
+    ver="$(resolve_latest_of_series "$series")" || exit 1
+    echo "➡️  Series $series: latest patch = ${ver}"
+    install_version "$ver"
+    ;;
+  -h|--help)
+    usage
+    ;;
+  *)
+    VERSION="$1"
+    install_version "$VERSION"
+    ;;
+esac
