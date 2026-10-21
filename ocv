@@ -4,7 +4,10 @@ if [[ -z "${BASH_VERSION:-}" ]]; then exec /usr/bin/env bash "$0" "$@"; fi
 
 set -euo pipefail
 
-MIRROR_BASE="https://mirror.openshift.com/pub/openshift-v4/clients/ocp"
+MIRROR_ROOT="https://mirror.openshift.com/pub/openshift-v4"
+MIRROR_BASE="${MIRROR_ROOT}/clients/ocp"
+# Engineering/feature candidates are published here instead of under ocp/
+DEV_PREVIEW_BASE="${MIRROR_ROOT}/clients/ocp-dev-preview"
 DRY_RUN=false
 FORCE=false
 IGNORE_SHA=false
@@ -14,6 +17,11 @@ CONFIG_FILE="${HOME}/.ocv.conf"
 CACHE_DIR="${HOME}/.cache/ocv"
 CACHE_TIMEOUT=3600  # 1 hour
 DEFAULT_SERIES=""
+
+# X.Y.Z (GA) or X.Y.Z-{ec,fc,rc}.N (pre-release). Nightlies/hotfixes are ignored.
+VERSION_RE='[0-9]+\.[0-9]+\.[0-9]+(-(ec|fc|rc)\.[0-9]+)?'
+GA_RE='[0-9]+\.[0-9]+\.[0-9]+'
+PRERELEASE_RE='[0-9]+\.[0-9]+\.[0-9]+-(ec|fc|rc)\.[0-9]+'
 TEMP_DIR=""
 
 # Cleanup and error handling
@@ -57,11 +65,13 @@ usage() {
 OpenShift CLI Version Manager
 
 Usage:
-  $(basename "$0") list                     # list remote versions (* = active, + = installed)
+  $(basename "$0") list                     # list remote GA versions (* = active, + = installed)
+  $(basename "$0") list beta               # list unreleased pre-releases (ec/fc/rc)
+  $(basename "$0") list all                # list GA and all pre-release versions
   $(basename "$0") list installed          # list versions installed locally
-  $(basename "$0") list latest <series>    # show latest patch of series, without installing
+  $(basename "$0") list latest <series>    # show latest GA patch of series, without installing
   $(basename "$0") list <series>           # list remote versions of a series (e.g., list 4.18)
-  $(basename "$0") <version>               # install specific version (e.g., 4.18.24)
+  $(basename "$0") <version>               # install specific version (e.g., 4.18.24, 4.23.0-ec.1)
   $(basename "$0") latest <series>         # install latest patch of series (e.g., latest 4.18)
   $(basename "$0") latest                  # install latest of remembered series
   $(basename "$0") use <version>           # switch to already installed version
@@ -73,7 +83,9 @@ Examples:
   $(basename "$0") list installed          # Show what's installed locally
   $(basename "$0") list latest 4.18        # Print latest 4.18.x (no install)
   $(basename "$0") list 4.18               # Show all remote 4.18.x versions
+  $(basename "$0") list beta               # Show pre-releases of upcoming versions
   $(basename "$0") 4.18.24                 # Install specific version
+  $(basename "$0") 5.0.0-rc.7              # Install a pre-release (never picked by 'latest')
   $(basename "$0") latest 4.18             # Install latest 4.18.x (remembers series)
   $(basename "$0") latest                   # Install latest of remembered series
   $(basename "$0") use 4.16.30             # Switch to already installed version
@@ -94,17 +106,33 @@ EOF
 # Input validation
 validate_version() {
   local version="$1"
-  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "Error: Invalid version format '$version'. Expected format: X.Y.Z (e.g., 4.18.24)" >&2
+  if [[ ! "$version" =~ ^${VERSION_RE}$ ]]; then
+    echo "Error: Invalid version format '$version'. Expected X.Y.Z or X.Y.Z-{ec,fc,rc}.N (e.g., 4.18.24, 5.0.0-rc.7)" >&2
     return 1
   fi
 }
 
+is_prerelease() {
+  [[ "$1" =~ ^${PRERELEASE_RE}$ ]]
+}
+
 # Version comparison utilities
-# Portable numeric X.Y.Z sort (works on both BSD/macOS and GNU sort;
-# `sort -V` is not available on stock macOS)
+# Portable version sort (works on both BSD/macOS and GNU sort; `sort -V` is
+# not available on stock macOS, and GNU `sort -V` puts 5.0.0 before
+# 5.0.0-rc.0). Each line gets a numeric key "X Y Z stage N", where
+# stage is ec=0 < fc=1 < rc=2 < GA=3, then the key is stripped.
 version_sort() {
-  sort -t. -k1,1n -k2,2n -k3,3n
+  awk '{
+    v = $0; stage = 3; n = 0
+    if (match(v, /-(ec|fc|rc)\.[0-9]+$/)) {
+      split(substr(v, RSTART + 1), p, ".")
+      stage = (p[1] == "ec") ? 0 : (p[1] == "fc") ? 1 : 2
+      n = p[2]
+      v = substr(v, 1, RSTART - 1)
+    }
+    split(v, a, ".")
+    print a[1]+0, a[2]+0, a[3]+0, stage, n+0, $0
+  }' | sort -k1,1n -k2,2n -k3,3n -k4,4n -k5,5n | cut -d' ' -f6
 }
 
 version_min() {
@@ -145,13 +173,13 @@ active_version() {
   local t
   if [[ -L "${br}/oc" ]]; then
     t="$(readlink "${br}/oc")"
-    if [[ "$t" =~ /ocp/([0-9]+\.[0-9]+\.[0-9]+)/oc$ ]]; then
+    if [[ "$t" =~ /ocp/(${VERSION_RE})/oc$ ]]; then
       echo "${BASH_REMATCH[1]}"; return 0
     fi
   fi
   if [[ -L "${br}/openshift-install" ]]; then
     t="$(readlink "${br}/openshift-install")"
-    if [[ "$t" =~ /ocp/([0-9]+\.[0-9]+\.[0-9]+)/openshift-install$ ]]; then
+    if [[ "$t" =~ /ocp/(${VERSION_RE})/openshift-install$ ]]; then
       echo "${BASH_REMATCH[1]}"; return 0
     fi
   fi
@@ -159,11 +187,12 @@ active_version() {
 }
 
 # ---------- listings with caching ----------
-# Usage: list_remote_versions [refresh]
-#   Pass "refresh" to bypass the cache TTL (used by `check`).
-list_remote_versions() {
-  local mode="${1:-}"
-  local cache_file="${CACHE_DIR}/versions.txt"
+# Usage: fetch_cached <cache file name> <mode> <producer function>
+#   Prints the cached output of <producer>, re-running it when the cache is
+#   older than CACHE_TIMEOUT or mode is "refresh" (used by `check`).
+fetch_cached() {
+  local name="$1" mode="$2" producer="$3"
+  local cache_file="${CACHE_DIR}/${name}"
   local cache_age=999999
 
   mkdir -p "$CACHE_DIR"
@@ -176,13 +205,8 @@ list_remote_versions() {
     echo "Fetching latest versions..." >&2
     # Write to a temp file and swap in only on success, so a network
     # failure never truncates/destroys the existing cache.
-    # -f makes curl fail on HTTP errors (plain -s would cache an error page).
-    local tmp="${TEMP_DIR}/versions.txt"
-    if curl -fsS "${MIRROR_BASE}/" \
-        | grep -Eo 'href="[0-9]+\.[0-9]+\.[0-9]+/' \
-        | sed 's/href="//;s#/##' \
-        | version_sort \
-        | uniq > "$tmp" && [[ -s "$tmp" ]]; then
+    local tmp="${TEMP_DIR}/${name}"
+    if "$producer" > "$tmp" && [[ -s "$tmp" ]]; then
       mv -f "$tmp" "$cache_file"
     elif [[ -s "$cache_file" ]]; then
       echo "Using cached versions (network unavailable)" >&2
@@ -195,6 +219,67 @@ list_remote_versions() {
   cat "$cache_file" 2>/dev/null || return 1
 }
 
+# Producers: scrape the mirror's directory listings.
+# -f makes curl fail on HTTP errors (plain -s would cache an error page).
+_fetch_ga_versions() {
+  curl -fsS "${MIRROR_BASE}/" \
+    | grep -Eo "href=\"${GA_RE}/" \
+    | sed 's/href="//;s#/##' \
+    | version_sort \
+    | uniq
+}
+
+# RCs live under ocp/, ECs and FCs mostly under ocp-dev-preview/.
+_fetch_prerelease_versions() {
+  { curl -fsS "${MIRROR_BASE}/" && curl -fsS "${DEV_PREVIEW_BASE}/"; } \
+    | grep -Eo "href=\"${PRERELEASE_RE}/" \
+    | sed 's/href="//;s#/##' \
+    | version_sort \
+    | uniq
+}
+
+# Usage: list_remote_versions [refresh]   -> GA versions only
+list_remote_versions() {
+  fetch_cached versions.txt "${1:-}" _fetch_ga_versions
+}
+
+# Usage: list_prerelease_versions [refresh]   -> every ec/fc/rc on the mirror
+list_prerelease_versions() {
+  fetch_cached prereleases.txt "${1:-}" _fetch_prerelease_versions
+}
+
+# Usage: list_beta_versions [refresh]
+#   Pre-releases of series (X.Y) that have no GA release yet, i.e. the betas
+#   that are still relevant. Matched by series rather than by X.Y.Z because
+#   some series never shipped an X.Y.0 GA (4.18 started at 4.18.1).
+list_beta_versions() {
+  local ga; ga="$(list_remote_versions "${1:-}")" || return 1
+  list_prerelease_versions "${1:-}" \
+    | awk -F. 'NR == FNR { ga[$1 "." $2] = 1; next } !(($1 "." $2) in ga)' \
+        <(printf '%s\n' "$ga") -
+}
+
+# Usage: list_all_versions   -> GA and every pre-release, sorted
+list_all_versions() {
+  { list_remote_versions && list_prerelease_versions; } | version_sort
+}
+
+# Reads versions on stdin, prints them with markers (* = active, + = installed)
+print_marked_versions() {
+  local installed; installed="$(raw_installed_versions)"
+  local av; av="$(active_version 2>/dev/null || true)"
+  local v
+  while IFS= read -r v; do
+    if [[ -n "$av" && "$v" == "$av" ]]; then
+      echo "* $v"
+    elif printf '%s\n' "$installed" | grep -qxF "$v"; then
+      echo "+ $v"
+    else
+      echo "  $v"
+    fi
+  done
+}
+
 # Pretty, marked list (for user)
 list_installed_versions() {
   local root; root="$(ocp_root)"
@@ -202,7 +287,7 @@ list_installed_versions() {
   if [[ -d "$root" ]]; then
     find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
       | awk -F/ '{print $NF}' \
-      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+      | grep -E "^${VERSION_RE}$" \
       | version_sort \
       | while read -r v; do
           if [[ -n "$active" && "$v" == "$active" ]]; then
@@ -222,13 +307,21 @@ raw_installed_versions() {
   if [[ -d "$root" ]]; then
     find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
       | awk -F/ '{print $NF}' \
-      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+      | grep -E "^${VERSION_RE}$" \
       | version_sort
   fi
 }
 
+# Highest installed GA version; falls back to the highest pre-release only
+# when no GA version is installed.
 latest_installed_version() {
-  raw_installed_versions | tail -n1
+  local all; all="$(raw_installed_versions)"
+  local ga; ga="$(printf '%s\n' "$all" | grep -E "^${GA_RE}$" | tail -n1 || true)"
+  if [[ -n "$ga" ]]; then
+    echo "$ga"
+  else
+    printf '%s\n' "$all" | tail -n1
+  fi
 }
 
 # Update checking functionality
@@ -239,14 +332,21 @@ check_for_updates() {
     return 0
   fi
 
-  local series="${current%.*}"  # Extract X.Y from X.Y.Z
+  local series; series="$(echo "$current" | cut -d. -f1,2)"  # X.Y from X.Y.Z[-rc.N]
   # Force a cache refresh: checking for updates against a stale cache
   # defeats the purpose of `check`.
   local latest; latest="$(resolve_latest_of_series "$series" refresh 2>/dev/null || echo "")"
+  local hint="ocv latest $series"
+
+  # On a pre-release of a series with no GA yet, the update is a newer beta.
+  if [[ -z "$latest" ]] && is_prerelease "$current"; then
+    latest="$(list_beta_versions refresh 2>/dev/null | grep -E "^${series//./\\.}\." | tail -n1 || true)"
+    hint="ocv $latest"
+  fi
 
   if [[ -n "$latest" && "$latest" != "$current" ]] && is_version_newer "$current" "$latest"; then
     echo "📦 Update available: $current → $latest"
-    echo "Run: ocv latest $series"
+    echo "Run: $hint"
   else
     echo "✅ You're on the latest version of series $series: $current"
   fi
@@ -265,17 +365,36 @@ detect_platform() {
   # EXT already set to .tar.gz (Windows ZIPs are not relevant here)
 }
 
-# Mirror directory holding the artifacts for this platform.
+# Mirror "clients" directory holding the artifacts for this platform.
 # The default mirror's generic "linux" artifacts are amd64; ppc64le and s390x
 # builds (including openshift-install) live under a per-arch mirror, where
 # the generic name is the native binary.
-platform_mirror_base() {
+platform_clients_root() {
   case "$OS_NAME/$ARCH_NAME" in
     Linux/ppc64le|Linux/s390x)
-      echo "https://mirror.openshift.com/pub/openshift-v4/${ARCH_NAME}/clients/ocp" ;;
+      echo "${MIRROR_ROOT}/${ARCH_NAME}/clients" ;;
     *)
-      echo "$MIRROR_BASE" ;;
+      echo "${MIRROR_ROOT}/clients" ;;
   esac
+}
+
+# Echo the mirror URL of a version's directory, or fail if it isn't there.
+# GA versions live under ocp/; pre-releases under ocp/ (RCs) or
+# ocp-dev-preview/ (ECs/FCs), so those are probed in that order.
+version_base_url() {
+  local version="$1"
+  local root; root="$(platform_clients_root)"
+  local dirs=(ocp)
+  is_prerelease "$version" && dirs+=(ocp-dev-preview)
+  local d
+  for d in "${dirs[@]}"; do
+    if curl -fsI "${root}/${d}/${version}/sha256sum.txt" >/dev/null 2>&1; then
+      echo "${root}/${d}/${version}"
+      return 0
+    fi
+  done
+  echo "Error: version ${version} not found on the mirror (looked in: ${dirs[*]} under ${root})" >&2
+  return 1
 }
 
 # List candidate artifact names (in order), given kind=install|client and a version
@@ -460,7 +579,7 @@ current_version() {
   if [[ -L "${br}/oc" ]]; then
     oc_target="$(readlink "${br}/oc")"
     echo "oc -> $oc_target"
-    [[ "$oc_target" =~ /ocp/([0-9]+\.[0-9]+\.[0-9]+)/oc$ ]] && version="${BASH_REMATCH[1]}"
+    [[ "$oc_target" =~ /ocp/(${VERSION_RE})/oc$ ]] && version="${BASH_REMATCH[1]}"
   else
     echo "oc symlink not found"
   fi
@@ -468,7 +587,7 @@ current_version() {
   if [[ -L "${br}/openshift-install" ]]; then
     install_target="$(readlink "${br}/openshift-install")"
     echo "openshift-install -> $install_target"
-    if [[ -z "$version" && "$install_target" =~ /ocp/([0-9]+\.[0-9]+\.[0-9]+)/openshift-install$ ]]; then
+    if [[ -z "$version" && "$install_target" =~ /ocp/(${VERSION_RE})/openshift-install$ ]]; then
       version="${BASH_REMATCH[1]}"
     fi
   else
@@ -570,14 +689,17 @@ install_version() {
   # end, after download/verify/extract all succeed (atomic swap below).
 
   if $DRY_RUN; then
-    echo "DRY-RUN: would probe & download ${MIRROR_BASE}/${version}/{openshift-install-...,openshift-client-...}.tar.gz"
+    if is_prerelease "$version"; then
+      echo "DRY-RUN: would locate ${version} under ${MIRROR_BASE}/ or ${DEV_PREVIEW_BASE}/"
+    fi
+    echo "DRY-RUN: would probe & download .../${version}/{openshift-install-...,openshift-client-...}.tar.gz"
     echo "DRY-RUN: would extract into ${vd} and update symlinks in $(bin_root)"
     return
   fi
 
   detect_platform
 
-  local base_url; base_url="$(platform_mirror_base)/${version}"
+  local base_url; base_url="$(version_base_url "$version")" || exit 4
   # choose filenames by probing the mirror
   local installer; installer="$(pick_artifact install "$version" "$base_url")" || exit 4
   local client;    client="$(pick_artifact client  "$version" "$base_url")" || exit 4
@@ -683,33 +805,39 @@ case "$1" in
         fi
         resolve_latest_of_series "$series" || exit 1
         ;;
-      remote|all|"")
-        # default: remote listing with markers (* = active, + = installed)
-        _installed="$(raw_installed_versions)"
-        _av="$(active_version 2>/dev/null || true)"
-        while IFS= read -r v; do
-          if [[ -n "$_av" && "$v" == "$_av" ]]; then
-            echo "* $v"
-          elif echo "$_installed" | grep -qxF "$v"; then
-            echo "+ $v"
-          else
-            echo "  $v"
-          fi
-        done < <(list_remote_versions)
+      remote|"")
+        # default: GA versions with markers (* = active, + = installed)
+        list_remote_versions | print_marked_versions
+        ;;
+      all)
+        # GA plus every pre-release on the mirror
+        list_all_versions | print_marked_versions
+        ;;
+      beta)
+        # pre-releases whose GA hasn't shipped yet
+        betas="$(list_beta_versions)" || exit 1
+        if [[ -z "$betas" ]]; then
+          echo "No pre-releases available right now (see 'ocv list all' for past ones)" >&2
+          exit 0
+        fi
+        printf '%s\n' "$betas" | print_marked_versions
         ;;
       [0-9]*.[0-9]*)
-        # ocv list 4.18 -> filter remote list by series
+        # ocv list 4.18 -> filter remote list by series (GA + unreleased betas)
         series="$2"
         [[ "$series" =~ ^[0-9]+\.[0-9]+$ ]] \
           || { echo "Invalid series: $series (use X.Y, e.g. 4.18)" >&2; exit 1; }
-        list_remote_versions | grep -E "^${series//./\\.}\.[0-9]+$" || {
+        { list_remote_versions && list_beta_versions; } \
+          | grep -E "^${series//./\\.}\." \
+          | version_sort \
+          | grep . || {
           echo "No versions found for series $series" >&2
           exit 1
         }
         ;;
       *)
         echo "Unknown list target: '$2'" >&2
-        echo "Expected: installed, latest [<series>], remote, or a series like 4.18" >&2
+        echo "Expected: installed, latest [<series>], remote, beta, all, or a series like 4.18" >&2
         exit 1
         ;;
     esac
