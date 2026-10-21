@@ -187,11 +187,12 @@ active_version() {
 }
 
 # ---------- listings with caching ----------
-# Usage: fetch_cached <cache file name> <mode> <producer function>
+# Usage: fetch_cached <cache file name> <mode> <producer function> <label>
 #   Prints the cached output of <producer>, re-running it when the cache is
 #   older than CACHE_TIMEOUT or mode is "refresh" (used by `check`).
+#   <label> names what is fetched in the progress message (e.g. "GA").
 fetch_cached() {
-  local name="$1" mode="$2" producer="$3"
+  local name="$1" mode="$2" producer="$3" label="$4"
   local cache_file="${CACHE_DIR}/${name}"
   local cache_age=999999
 
@@ -202,16 +203,16 @@ fetch_cached() {
   fi
 
   if [[ "$mode" == "refresh" || $cache_age -gt $CACHE_TIMEOUT ]]; then
-    echo "Fetching latest versions..." >&2
+    echo "Fetching ${label} versions..." >&2
     # Write to a temp file and swap in only on success, so a network
     # failure never truncates/destroys the existing cache.
     local tmp="${TEMP_DIR}/${name}"
     if "$producer" > "$tmp" && [[ -s "$tmp" ]]; then
       mv -f "$tmp" "$cache_file"
     elif [[ -s "$cache_file" ]]; then
-      echo "Using cached versions (network unavailable)" >&2
+      echo "Using cached ${label} versions (network unavailable)" >&2
     else
-      echo "No cached versions available" >&2
+      echo "No cached ${label} versions available" >&2
       return 1
     fi
   fi
@@ -240,12 +241,12 @@ _fetch_prerelease_versions() {
 
 # Usage: list_remote_versions [refresh]   -> GA versions only
 list_remote_versions() {
-  fetch_cached versions.txt "${1:-}" _fetch_ga_versions
+  fetch_cached versions.txt "${1:-}" _fetch_ga_versions GA
 }
 
 # Usage: list_prerelease_versions [refresh]   -> every ec/fc/rc on the mirror
 list_prerelease_versions() {
-  fetch_cached prereleases.txt "${1:-}" _fetch_prerelease_versions
+  fetch_cached prereleases.txt "${1:-}" _fetch_prerelease_versions pre-release
 }
 
 # Usage: list_beta_versions [refresh]
