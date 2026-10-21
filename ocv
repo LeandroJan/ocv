@@ -265,6 +265,19 @@ detect_platform() {
   # EXT already set to .tar.gz (Windows ZIPs are not relevant here)
 }
 
+# Mirror directory holding the artifacts for this platform.
+# The default mirror's generic "linux" artifacts are amd64; ppc64le and s390x
+# builds (including openshift-install) live under a per-arch mirror, where
+# the generic name is the native binary.
+platform_mirror_base() {
+  case "$OS_NAME/$ARCH_NAME" in
+    Linux/ppc64le|Linux/s390x)
+      echo "https://mirror.openshift.com/pub/openshift-v4/${ARCH_NAME}/clients/ocp" ;;
+    *)
+      echo "$MIRROR_BASE" ;;
+  esac
+}
+
 # List candidate artifact names (in order), given kind=install|client and a version
 artifact_candidates() {
   local kind="$1" version="$2"
@@ -303,29 +316,22 @@ artifact_candidates() {
           fi
           ;;
         aarch64|arm64)
+          # No generic fallback: the generic linux artifact is amd64.
           if [[ "$kind" == "install" ]]; then
             printf "openshift-install-linux-arm64-%s%s\n" "$version" "$EXT"
-            printf "openshift-install-linux-%s%s\n" "$version" "$EXT"   # fallback generic
           else
             printf "openshift-client-linux-arm64-%s%s\n" "$version" "$EXT"
-            printf "openshift-client-linux-%s%s\n" "$version" "$EXT"    # fallback generic
           fi
           ;;
-        ppc64le)
-          if [[ "$kind" == "install" ]]; then
-            # installer usually not provided for ppc64le; try generic as last resort
-            printf "openshift-install-linux-%s%s\n" "$version" "$EXT"
-          else
-            printf "openshift-client-linux-ppc64le-%s%s\n" "$version" "$EXT"
-            printf "openshift-client-linux-%s%s\n"         "$version" "$EXT"
-          fi
-          ;;
-        s390x)
+        ppc64le|s390x)
+          # Served from the per-arch mirror (see platform_mirror_base),
+          # where the generic name is the native binary.
           if [[ "$kind" == "install" ]]; then
             printf "openshift-install-linux-%s%s\n" "$version" "$EXT"
           else
-            printf "openshift-client-linux-s390x-%s%s\n" "$version" "$EXT"
-            printf "openshift-client-linux-%s%s\n"       "$version" "$EXT"
+            printf "openshift-client-linux-%s%s\n"                "$version" "$EXT"
+            printf "openshift-client-linux-%s-rhel9-%s%s\n" "$ARCH_NAME" "$version" "$EXT"
+            printf "openshift-client-linux-%s-rhel8-%s%s\n" "$ARCH_NAME" "$version" "$EXT"
           fi
           ;;
         *)
@@ -352,9 +358,9 @@ pick_artifact() {
 }
 
 verify_sha256() {
-  local version="$1" file_path="$2"
+  local version="$1" file_path="$2" base_url="$3"
   local file_name; file_name="$(basename "$file_path")"
-  local sums_url="${MIRROR_BASE}/${version}/sha256sum.txt"
+  local sums_url="${base_url}/sha256sum.txt"
 
   if [[ "${IGNORE_SHA:-false}" == "true" ]]; then
     echo "⚠️  SHA256 verification skipped (--ignore-sha enabled) for ${file_name}"
@@ -390,7 +396,10 @@ verify_sha256() {
     actual="$(shasum -a 256 "$file_path" | awk '{print $1}')"
   fi
   [[ "$actual" == "$expected" ]] || {
-    echo "Invalid SHA256 for $file_name" >&2
+    # Drop the bad archive from the download cache; otherwise the next run
+    # "resumes" a file that is already complete and fails here forever.
+    rm -f "$file_path"
+    echo "Invalid SHA256 for $file_name (removed from cache, re-run to download again)" >&2
     echo "Expected: $expected" >&2
     echo "Actual:   $actual" >&2
     echo "Use --ignore-sha to skip verification if you're aware of known mismatches." >&2
@@ -406,7 +415,12 @@ extract_tar() {
     return
   fi
   mkdir -p "$dest"
-  tar -xzf "$archive" -C "$dest"
+  tar -xzf "$archive" -C "$dest" || {
+    # Same reasoning as a SHA mismatch: don't keep a corrupt cached archive.
+    rm -f "$archive"
+    echo "Error: failed to extract $(basename "$archive") (removed from cache, re-run to download again)" >&2
+    exit 4
+  }
 }
 
 # ---------- operations ----------
@@ -563,7 +577,7 @@ install_version() {
 
   detect_platform
 
-  local base_url="${MIRROR_BASE}/${version}"
+  local base_url; base_url="$(platform_mirror_base)/${version}"
   # choose filenames by probing the mirror
   local installer; installer="$(pick_artifact install "$version" "$base_url")" || exit 4
   local client;    client="$(pick_artifact client  "$version" "$base_url")" || exit 4
@@ -582,8 +596,8 @@ install_version() {
   download_with_progress "${base_url}/${installer}" "${installer_path}"
   download_with_progress "${base_url}/${client}" "${client_path}"
 
-  verify_sha256 "$version" "${installer_path}"
-  verify_sha256 "$version" "${client_path}"
+  verify_sha256 "$version" "${installer_path}" "$base_url"
+  verify_sha256 "$version" "${client_path}"    "$base_url"
 
   echo "Extracting ..."
   extract_tar "${installer_path}" "${extract_dir}/installer"
@@ -718,14 +732,10 @@ case "$1" in
     check_for_updates
     ;;
   latest)
+    remember=false
     if [[ $# -ge 2 ]]; then
       series="$2"
-      if $DRY_RUN; then
-        echo "DRY-RUN: would remember series ${series} in ${CONFIG_FILE}"
-      else
-        DEFAULT_SERIES="$series"
-        save_config
-      fi
+      remember=true
     elif [[ -n "$DEFAULT_SERIES" ]]; then
       series="$DEFAULT_SERIES"
       echo "Using remembered series: $series"
@@ -736,6 +746,18 @@ case "$1" in
     fi
 
     ver="$(resolve_latest_of_series "$series")" || exit 1
+
+    # Only remember the series once it is known to exist on the mirror, so a
+    # typo can't overwrite a good remembered series.
+    if $remember; then
+      if $DRY_RUN; then
+        echo "DRY-RUN: would remember series ${series} in ${CONFIG_FILE}"
+      else
+        DEFAULT_SERIES="$series"
+        save_config
+      fi
+    fi
+
     echo "➡️  Series $series: latest patch = ${ver}"
     install_version "$ver"
     ;;
