@@ -303,8 +303,9 @@ print_marked_versions() {
   done
 }
 
-# Pretty, marked list (for user). * = oc or openshift-install points here;
-# versions holding a single component say which one.
+# Pretty, marked list (for user). * = a symlink points here, and "← ..."
+# names which one(s), since oc and openshift-install may be on different
+# versions; versions holding a single component say which one.
 list_installed_versions() {
   local versions; versions="$(raw_installed_versions)"
   if [[ -z "$versions" ]]; then
@@ -314,17 +315,39 @@ list_installed_versions() {
   local oc_v inst_v
   oc_v="$(linked_version oc 2>/dev/null || true)"
   inst_v="$(linked_version openshift-install 2>/dev/null || true)"
-  local v mark note
+
+  # Width of the "version  (note)" column, so the arrows line up
+  local v label width=0
   while IFS= read -r v; do
-    mark=" "; note=""
-    [[ "$v" == "$oc_v" || "$v" == "$inst_v" ]] && mark="*"
-    if ! has_component "$v" openshift-install; then
-      note="  (oc only)"
-    elif ! has_component "$v" oc; then
-      note="  (installer only)"
-    fi
-    echo "${mark} ${v}${note}"
+    label="$(installed_label "$v")"
+    if (( ${#label} > width )); then width=${#label}; fi
   done <<< "$versions"
+
+  local mark links
+  while IFS= read -r v; do
+    mark=" "; links=""
+    [[ "$v" == "$oc_v" ]]   && links="oc"
+    [[ "$v" == "$inst_v" ]] && links="${links:+$links, }openshift-install"
+    [[ -n "$links" ]] && mark="*"
+    label="$(installed_label "$v")"
+    if [[ -n "$links" ]]; then
+      printf '%s %-*s  ← %s\n' "$mark" "$width" "$label" "$links"
+    else
+      printf '%s %s\n' "$mark" "$label"
+    fi
+  done <<< "$versions"
+}
+
+# "4.20.34  (oc only)" / "4.22.19": a version plus what it holds when partial
+installed_label() {
+  local v="$1"
+  if ! has_component "$v" openshift-install; then
+    echo "${v}  (oc only)"
+  elif ! has_component "$v" oc; then
+    echo "${v}  (installer only)"
+  else
+    echo "$v"
+  fi
 }
 
 # Raw, unformatted list (for internal logic): version dirs holding at least
