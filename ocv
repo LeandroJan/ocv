@@ -11,6 +11,8 @@ DEV_PREVIEW_BASE="${MIRROR_ROOT}/clients/ocp-dev-preview"
 DRY_RUN=false
 FORCE=false
 IGNORE_SHA=false
+# Components install/use/delete act on (narrowed by --oc-only/--installer-only)
+COMPONENTS="oc openshift-install"
 
 # Configuration and caching
 CONFIG_FILE="${HOME}/.ocv.conf"
@@ -71,7 +73,8 @@ Usage:
   $(basename "$0") list installed          # list versions installed locally
   $(basename "$0") list latest <series>    # show latest GA patch of series, without installing
   $(basename "$0") list <series>           # list remote versions of a series (e.g., list 4.18)
-  $(basename "$0") <version>               # install specific version (e.g., 4.18.24, 4.23.0-ec.1)
+  $(basename "$0") <version>               # install specific version (e.g., 4.18.24, 4.23.0-ec.1);
+                                           #   skips components already installed, then switches links
   $(basename "$0") latest <series>         # install latest patch of series (e.g., latest 4.18)
   $(basename "$0") latest                  # install latest of remembered series
   $(basename "$0") use <version>           # switch to already installed version
@@ -88,14 +91,18 @@ Examples:
   $(basename "$0") 5.0.0-rc.7              # Install a pre-release (never picked by 'latest')
   $(basename "$0") latest 4.18             # Install latest 4.18.x (remembers series)
   $(basename "$0") latest                   # Install latest of remembered series
+  $(basename "$0") 4.22.19 --oc-only       # Install/switch only oc (installer link untouched)
   $(basename "$0") use 4.16.30             # Switch to already installed version
   $(basename "$0") check                    # Check if newer version available
   $(basename "$0") delete 4.16.30          # Remove old version
+  $(basename "$0") delete 4.16.30 --installer-only   # Remove only its openshift-install
 
 Options:
-  --dry-run      Show what would happen without making changes
-  --force        Force reinstall of an already installed version
-  --ignore-sha   Skip SHA256 verification
+  --dry-run          Show what would happen without making changes
+  --force            Force reinstall of an already installed version
+  --ignore-sha       Skip SHA256 verification
+  --oc-only          Install/use/delete only oc
+  --installer-only   Install/use/delete only openshift-install
 
 Configuration:
   Config file: ~/.ocv.conf
@@ -167,23 +174,38 @@ bin_root() { echo "$HOME/bin"; }
 ocp_root() { echo "$(bin_root)/ocp"; }
 version_dir() { echo "$(ocp_root)/$1"; }
 
-# ---------- active version helper ----------
+# ---------- components ----------
+# Each version dir may hold oc, openshift-install or both; the file on disk
+# is the source of truth for what a version has.
+ALL_COMPONENTS="oc openshift-install"
+
+has_component() {
+  local version="$1" comp="$2"
+  [[ -f "$(version_dir "$version")/${comp}" ]]
+}
+
+# Artifact kind used by artifact_candidates for a component
+component_kind() {
+  case "$1" in
+    oc) echo client ;;
+    openshift-install) echo install ;;
+  esac
+}
+
+# ---------- active version helpers ----------
+# Echo the version a component's symlink in ~/bin points to, or fail.
+linked_version() {
+  local comp="$1" t
+  local link; link="$(bin_root)/${comp}"
+  [[ -L "$link" ]] || return 1
+  t="$(readlink "$link")"
+  [[ "$t" =~ /ocp/(${VERSION_RE})/${comp}$ ]] || return 1
+  echo "${BASH_REMATCH[1]}"
+}
+
+# The active version is the one oc points to (falls back to openshift-install).
 active_version() {
-  local br; br="$(bin_root)"
-  local t
-  if [[ -L "${br}/oc" ]]; then
-    t="$(readlink "${br}/oc")"
-    if [[ "$t" =~ /ocp/(${VERSION_RE})/oc$ ]]; then
-      echo "${BASH_REMATCH[1]}"; return 0
-    fi
-  fi
-  if [[ -L "${br}/openshift-install" ]]; then
-    t="$(readlink "${br}/openshift-install")"
-    if [[ "$t" =~ /ocp/(${VERSION_RE})/openshift-install$ ]]; then
-      echo "${BASH_REMATCH[1]}"; return 0
-    fi
-  fi
-  return 1
+  linked_version oc || linked_version openshift-install
 }
 
 # ---------- listings with caching ----------
@@ -281,47 +303,62 @@ print_marked_versions() {
   done
 }
 
-# Pretty, marked list (for user)
+# Pretty, marked list (for user). * = oc or openshift-install points here;
+# versions holding a single component say which one.
 list_installed_versions() {
-  local root; root="$(ocp_root)"
-  local active; active="$(active_version 2>/dev/null || true)"
-  if [[ -d "$root" ]]; then
-    find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
-      | awk -F/ '{print $NF}' \
-      | grep -E "^${VERSION_RE}$" \
-      | version_sort \
-      | while read -r v; do
-          if [[ -n "$active" && "$v" == "$active" ]]; then
-            echo "* $v"
-          else
-            echo "  $v"
-          fi
-        done
-  else
+  local versions; versions="$(raw_installed_versions)"
+  if [[ -z "$versions" ]]; then
     echo "(none installed)"
+    return 0
   fi
+  local oc_v inst_v
+  oc_v="$(linked_version oc 2>/dev/null || true)"
+  inst_v="$(linked_version openshift-install 2>/dev/null || true)"
+  local v mark note
+  while IFS= read -r v; do
+    mark=" "; note=""
+    [[ "$v" == "$oc_v" || "$v" == "$inst_v" ]] && mark="*"
+    if ! has_component "$v" openshift-install; then
+      note="  (oc only)"
+    elif ! has_component "$v" oc; then
+      note="  (installer only)"
+    fi
+    echo "${mark} ${v}${note}"
+  done <<< "$versions"
 }
 
-# Raw, unformatted list (for internal logic)
+# Raw, unformatted list (for internal logic): version dirs holding at least
+# one component (a dir left with only a staging file doesn't count).
 raw_installed_versions() {
   local root; root="$(ocp_root)"
-  if [[ -d "$root" ]]; then
-    find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
-      | awk -F/ '{print $NF}' \
-      | grep -E "^${VERSION_RE}$" \
-      | version_sort
-  fi
+  [[ -d "$root" ]] || return 0
+  local v
+  find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
+    | awk -F/ '{print $NF}' \
+    | { grep -E "^${VERSION_RE}$" || true; } \
+    | version_sort \
+    | while IFS= read -r v; do
+        if has_component "$v" oc || has_component "$v" openshift-install; then
+          echo "$v"
+        fi
+      done
 }
 
-# Highest installed GA version; falls back to the highest pre-release only
-# when no GA version is installed.
-latest_installed_version() {
-  local all; all="$(raw_installed_versions)"
-  local ga; ga="$(printf '%s\n' "$all" | grep -E "^${GA_RE}$" | tail -n1 || true)"
+# Usage: latest_installed_with <component> [<version to skip>]
+#   Highest installed GA version holding <component>; falls back to the
+#   highest pre-release only when no GA version has it.
+latest_installed_with() {
+  local comp="$1" skip="${2:-}"
+  local candidates v
+  candidates="$(raw_installed_versions | while IFS= read -r v; do
+    [[ "$v" != "$skip" ]] && has_component "$v" "$comp" && echo "$v"
+  done || true)"
+  [[ -n "$candidates" ]] || return 0
+  local ga; ga="$(printf '%s\n' "$candidates" | grep -E "^${GA_RE}$" | tail -n1 || true)"
   if [[ -n "$ga" ]]; then
     echo "$ga"
   else
-    printf '%s\n' "$all" | tail -n1
+    printf '%s\n' "$candidates" | tail -n1
   fi
 }
 
@@ -444,7 +481,7 @@ artifact_candidates() {
           fi
           ;;
         ppc64le|s390x)
-          # Served from the per-arch mirror (see platform_mirror_base),
+          # Served from the per-arch mirror (see platform_clients_root),
           # where the generic name is the native binary.
           if [[ "$kind" == "install" ]]; then
             printf "openshift-install-linux-%s%s\n" "$version" "$EXT"
@@ -544,71 +581,90 @@ extract_tar() {
 }
 
 # ---------- operations ----------
-link_version() {
-  local version="$1"
-  local br; br="$(bin_root)"
-  local vd; vd="$(version_dir "$version")"
-
+link_component() {
+  local version="$1" comp="$2"
+  local target; target="$(version_dir "$version")/${comp}"
+  local link; link="$(bin_root)/${comp}"
   if $DRY_RUN; then
-    echo "DRY-RUN: ln -sfn ${vd}/oc ${br}/oc"
-    echo "DRY-RUN: ln -sfn ${vd}/openshift-install ${br}/openshift-install"
-    return
+    echo "DRY-RUN: ln -sfn ${target} ${link}"
+  else
+    ln -sfn "$target" "$link"
   fi
+}
 
-  ln -sfn "${vd}/oc"                "${br}/oc"
-  ln -sfn "${vd}/openshift-install" "${br}/openshift-install"
-  echo "Symlinks updated -> ${version}"
-
+path_hint() {
   if ! echo ":$PATH:" | grep -q ":$HOME/bin:"; then
     echo "ℹ️  Add ~/bin to PATH (e.g., zsh):"
     echo '   echo '\''export PATH="$HOME/bin:$PATH"'\'' >> ~/.zshrc && exec zsh'
   fi
 }
 
+# Usage: link_version <version> <components>
+#   Points each requested component's symlink at <version>. A component the
+#   version doesn't have keeps its current link (with a note), so mixing
+#   e.g. oc 4.23 with openshift-install 4.22 is possible on purpose.
+link_version() {
+  local version="$1" comps="$2"
+  local comp linked=""
+  mkdir -p "$(bin_root)"
+  for comp in $comps; do
+    if $DRY_RUN || has_component "$version" "$comp"; then
+      link_component "$version" "$comp"
+      linked="${linked:+$linked, }${comp}"
+    else
+      local cur; cur="$(linked_version "$comp" 2>/dev/null || true)"
+      if [[ -n "$cur" ]]; then
+        echo "ℹ️  ${comp} not installed for ${version}; still pointing to ${cur}"
+      else
+        echo "ℹ️  ${comp} not installed for ${version}; not linked"
+      fi
+    fi
+  done
+  if ! $DRY_RUN && [[ -n "$linked" ]]; then
+    echo "Symlinks updated -> ${version} (${linked})"
+    path_hint
+  fi
+}
+
 use_version() {
   local version="$1"
   validate_version "$version" || exit 1
-  local vd; vd="$(version_dir "$version")"
-  [[ -d "$vd" ]] || { echo "Version not installed: ${vd}"; exit 4; }
-  link_version "$version"
+  local comp found=false
+  for comp in $COMPONENTS; do
+    has_component "$version" "$comp" && found=true
+  done
+  $found || { echo "Version not installed (${COMPONENTS// /, }): ${version}"; exit 4; }
+  link_version "$version" "$COMPONENTS"
 }
 
 current_version() {
   local br; br="$(bin_root)"
-  local oc_target install_target version=""
+  local comp v versions=""
 
-  if [[ -L "${br}/oc" ]]; then
-    oc_target="$(readlink "${br}/oc")"
-    echo "oc -> $oc_target"
-    [[ "$oc_target" =~ /ocp/(${VERSION_RE})/oc$ ]] && version="${BASH_REMATCH[1]}"
-  else
-    echo "oc symlink not found"
-  fi
-
-  if [[ -L "${br}/openshift-install" ]]; then
-    install_target="$(readlink "${br}/openshift-install")"
-    echo "openshift-install -> $install_target"
-    if [[ -z "$version" && "$install_target" =~ /ocp/(${VERSION_RE})/openshift-install$ ]]; then
-      version="${BASH_REMATCH[1]}"
+  for comp in $ALL_COMPONENTS; do
+    if [[ -L "${br}/${comp}" ]]; then
+      echo "${comp} -> $(readlink "${br}/${comp}")"
+      v="$(linked_version "$comp" 2>/dev/null || true)"
+      [[ -n "$v" ]] && versions="${versions:+$versions / }${comp}: ${v}"
+    else
+      echo "${comp} symlink not found"
     fi
-  else
-    echo "openshift-install symlink not found"
+  done
+
+  local oc_v inst_v
+  oc_v="$(linked_version oc 2>/dev/null || true)"
+  inst_v="$(linked_version openshift-install 2>/dev/null || true)"
+  if [[ -n "$oc_v" && -n "$inst_v" && "$oc_v" != "$inst_v" ]]; then
+    echo "⚠️  Warning: 'oc' and 'openshift-install' point to different versions (${versions})."
   fi
 
-  if [[ -n "$version" ]]; then
-    if [[ -n "${oc_target:-}" && -n "${install_target:-}" ]]; then
-      # Escape dots so 4.18.24 can't accidentally match e.g. 4x18y24
-      local escaped_version="${version//./\\.}"
-      if [[ ! "$oc_target" =~ /ocp/${escaped_version}/oc$ || ! "$install_target" =~ /ocp/${escaped_version}/openshift-install$ ]]; then
-        echo "⚠️  Warning: 'oc' and 'openshift-install' point to different versions."
-      fi
-    fi
-    echo "active version: $version"
-  else
-    echo "active version: (undefined)"
-  fi
+  local active; active="$(active_version 2>/dev/null || true)"
+  echo "active version: ${active:-(undefined)}"
 }
 
+# Removes the requested components of a version (the whole dir when nothing
+# is left), then relinks each removed component to the highest remaining
+# version that has it, or drops its symlink when none does.
 delete_version() {
   local version="$1"
   validate_version "$version" || exit 1
@@ -617,43 +673,51 @@ delete_version() {
 
   [[ -d "$vd" ]] || { echo "Version not found: ${vd}"; exit 4; }
 
-  # Consider "current" if either symlink points to this version
-  local was_current=false
-  [[ -L "${br}/oc" && "$(readlink "${br}/oc")" == "${vd}/oc" ]] && was_current=true
-  [[ -L "${br}/openshift-install" && "$(readlink "${br}/openshift-install")" == "${vd}/openshift-install" ]] && was_current=true
+  local comp removed=""
+  for comp in $COMPONENTS; do
+    has_component "$version" "$comp" && removed="${removed:+$removed }${comp}"
+  done
+  [[ -n "$removed" ]] || { echo "Version ${version} has no ${COMPONENTS// /, } installed"; exit 4; }
+
+  # What remains once the requested components are gone?
+  local remaining=""
+  for comp in $ALL_COMPONENTS; do
+    [[ " $removed " == *" $comp "* ]] && continue
+    has_component "$version" "$comp" && remaining="${remaining:+$remaining }${comp}"
+  done
 
   if $DRY_RUN; then
-    echo "DRY-RUN: rm -rf ${vd}"
-  else
-    rm -rf "${vd}"
-    echo "Removed version ${version}"
-  fi
-
-  # Determine highest remaining version after deletion
-  local latest; latest="$(latest_installed_version || true)"
-
-  # Are current symlinks valid?
-  local oc_ok=false inst_ok=false
-  [[ -L "${br}/oc"                && -e "$(readlink "${br}/oc")"                ]] && oc_ok=true
-  [[ -L "${br}/openshift-install" && -e "$(readlink "${br}/openshift-install")" ]] && inst_ok=true
-  local symlinks_broken=false
-  $oc_ok && $inst_ok || symlinks_broken=true
-
-  if [[ -n "${latest:-}" && -d "$(version_dir "$latest")" ]]; then
-    # If deleted was active OR links are broken/missing, relink to latest
-    if $was_current || $symlinks_broken; then
-      echo "Relinking to ${latest}"
-      link_version "$latest"
+    if [[ -z "$remaining" ]]; then echo "DRY-RUN: rm -rf ${vd}"; else
+      for comp in $removed; do echo "DRY-RUN: rm -f ${vd}/${comp}"; done
     fi
   else
-    # No versions left — remove symlinks
-    echo "No other versions installed, removing symlinks"
-    if $DRY_RUN; then
-      echo "DRY-RUN: rm -f \"${br}/oc\" \"${br}/openshift-install\""
+    if [[ -z "$remaining" ]]; then
+      rm -rf "$vd"
     else
-      rm -f "${br}/oc" "${br}/openshift-install"
+      for comp in $removed; do rm -f "${vd}/${comp}"; done
     fi
+    echo "Removed ${version} (${removed// /, })"
   fi
+
+  # Relink removed components whose symlink pointed here, or is dangling.
+  local cur next
+  for comp in $removed; do
+    cur="$(linked_version "$comp" 2>/dev/null || true)"
+    if [[ "$cur" == "$version" ]] || [[ -L "${br}/${comp}" && ! -e "${br}/${comp}" ]]; then
+      next="$(latest_installed_with "$comp" "$version")"
+      if [[ -n "$next" ]]; then
+        echo "Relinking ${comp} to ${next}"
+        link_component "$next" "$comp"
+      else
+        echo "No other version provides ${comp}, removing its symlink"
+        if $DRY_RUN; then
+          echo "DRY-RUN: rm -f ${br}/${comp}"
+        else
+          rm -f "${br}/${comp}"
+        fi
+      fi
+    fi
+  done
 
   # Show current state after delete
   current_version
@@ -681,75 +745,87 @@ install_version() {
   validate_version "$version" || exit 1
   local vd; vd="$(version_dir "$version")"
 
-  if [[ -d "$vd" && "$FORCE" != "true" ]]; then
-    echo "Version $version already installed at $vd"
-    echo "Use 'ocv use $version' to switch, or --force to reinstall"
+  # Components to fetch: the requested ones that are missing (all of the
+  # requested ones with --force). Present ones are skipped, not re-downloaded.
+  local comp todo=""
+  for comp in $COMPONENTS; do
+    if has_component "$version" "$comp" && [[ "$FORCE" != "true" ]]; then
+      echo "${comp} ${version} already installed, skipping download"
+    else
+      todo="${todo:+$todo }${comp}"
+    fi
+  done
+
+  if [[ -z "$todo" ]]; then
+    # Everything requested is there: just make it active.
+    link_version "$version" "$COMPONENTS"
     return 0
   fi
-  # Note: with --force the existing install is only removed at the very
-  # end, after download/verify/extract all succeed (atomic swap below).
 
   if $DRY_RUN; then
     if is_prerelease "$version"; then
       echo "DRY-RUN: would locate ${version} under ${MIRROR_BASE}/ or ${DEV_PREVIEW_BASE}/"
     fi
-    echo "DRY-RUN: would probe & download .../${version}/{openshift-install-...,openshift-client-...}.tar.gz"
-    echo "DRY-RUN: would extract into ${vd} and update symlinks in $(bin_root)"
-    return
+    echo "DRY-RUN: would download, verify and extract ${todo// /, } into ${vd}"
+    link_version "$version" "$COMPONENTS"
+    return 0
   fi
 
   detect_platform
 
   local base_url; base_url="$(version_base_url "$version")" || exit 4
-  # choose filenames by probing the mirror
-  local installer; installer="$(pick_artifact install "$version" "$base_url")" || exit 4
-  local client;    client="$(pick_artifact client  "$version" "$base_url")" || exit 4
+
+  # Probe every artifact before downloading anything, so a missing one
+  # fails fast. Kept as "component:filename" pairs (bash 3.2 has no maps).
+  local pairs="" artifact
+  for comp in $todo; do
+    artifact="$(pick_artifact "$(component_kind "$comp")" "$version" "$base_url")" || exit 4
+    pairs="${pairs:+$pairs }${comp}:${artifact}"
+  done
 
   # Downloads go to the cache dir (not TEMP_DIR) so curl -C - can resume
   # a previously interrupted download across runs.
   local dl_dir="${CACHE_DIR}/downloads"
   mkdir -p "$dl_dir"
-  local installer_path="${dl_dir}/${installer}"
-  local client_path="${dl_dir}/${client}"
   local extract_dir="${TEMP_DIR}/extract-${version}"
-  local staged_dir="${TEMP_DIR}/staged-${version}"
+  local pair
 
-  echo "➡️  Downloading ${version} (${OS_NAME}/${ARCH_NAME}) ..."
-
-  download_with_progress "${base_url}/${installer}" "${installer_path}"
-  download_with_progress "${base_url}/${client}" "${client_path}"
-
-  verify_sha256 "$version" "${installer_path}" "$base_url"
-  verify_sha256 "$version" "${client_path}"    "$base_url"
+  echo "➡️  Downloading ${version} (${OS_NAME}/${ARCH_NAME}): ${todo// /, }"
+  for pair in $pairs; do
+    download_with_progress "${base_url}/${pair#*:}" "${dl_dir}/${pair#*:}"
+  done
+  for pair in $pairs; do
+    verify_sha256 "$version" "${dl_dir}/${pair#*:}" "$base_url"
+  done
 
   echo "Extracting ..."
-  extract_tar "${installer_path}" "${extract_dir}/installer"
-  extract_tar "${client_path}"    "${extract_dir}/client"
+  for pair in $pairs; do
+    comp="${pair%%:*}"
+    extract_tar "${dl_dir}/${pair#*:}" "${extract_dir}/${comp}"
+    [[ -f "${extract_dir}/${comp}/${comp}" ]] \
+      || { echo "Error: ${comp} not found in ${pair#*:}" >&2; exit 4; }
+  done
 
-  # Stage the final layout in the temp dir, validating contents, so a
-  # failure here never leaves a half-populated version dir behind.
-  mkdir -p "$staged_dir"
-  [[ -f "${extract_dir}/installer/openshift-install" ]] \
-    || { echo "Error: openshift-install not found in ${installer}" >&2; exit 4; }
-  [[ -f "${extract_dir}/client/oc" ]] \
-    || { echo "Error: oc not found in ${client}" >&2; exit 4; }
-  mv -f "${extract_dir}/installer/openshift-install" "${staged_dir}/openshift-install"
-  mv -f "${extract_dir}/client/oc"                   "${staged_dir}/oc"
-  chmod +x "${staged_dir}/openshift-install" "${staged_dir}/oc"
-
-  # Atomic-ish swap: only now touch the real version dir.
-  mkdir -p "$(ocp_root)" "$(bin_root)"
-  if [[ -d "$vd" ]]; then
-    echo "Replacing existing installation (--force)..."
-    rm -rf "$vd"
-  fi
-  mv "$staged_dir" "$vd"
+  # Only now touch the real version dir, one file at a time: each binary is
+  # staged next to its final name and renamed into place. A rename within a
+  # directory is atomic, so the dir always holds either the old binary or
+  # the new one, never a partial file (moving a whole dir out of TEMP_DIR is
+  # a copy when /tmp is another filesystem, e.g. tmpfs).
+  mkdir -p "$vd"
+  for comp in $todo; do
+    mv -f "${extract_dir}/${comp}/${comp}" "${vd}/.${comp}.new"
+    chmod +x "${vd}/.${comp}.new"
+    mv -f "${vd}/.${comp}.new" "${vd}/${comp}"
+  done
 
   # Successful install: downloaded archives are no longer needed.
-  rm -f "$installer_path" "$client_path"
+  for pair in $pairs; do
+    rm -f "${dl_dir}/${pair#*:}"
+  done
 
-  echo "Installed under ${vd}"
-  link_version "$version"
+  echo "Installed ${todo// /, } under ${vd}"
+  # Links change only after every requested component is in place.
+  link_version "$version" "$COMPONENTS"
 }
 
 # ---------- argument parsing ----------
@@ -764,6 +840,16 @@ for arg in "$@"; do
       ;;
     --ignore-sha)
       IGNORE_SHA=true
+      ;;
+    --oc-only)
+      [[ "$COMPONENTS" == "openshift-install" ]] \
+        && { echo "Error: --oc-only and --installer-only are mutually exclusive" >&2; exit 1; }
+      COMPONENTS="oc"
+      ;;
+    --installer-only)
+      [[ "$COMPONENTS" == "oc" ]] \
+        && { echo "Error: --oc-only and --installer-only are mutually exclusive" >&2; exit 1; }
+      COMPONENTS="openshift-install"
       ;;
     *)
       args+=("$arg")
